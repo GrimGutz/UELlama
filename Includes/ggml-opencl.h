@@ -1,25 +1,26 @@
-#pragma once
+#ifndef GGML_OPENCL_H
+#define GGML_OPENCL_H
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #ifdef  __cplusplus
 extern "C" {
 #endif
 
-void ggml_cl_init(void);
+//
+// backend API
+//
+GGML_BACKEND_API ggml_backend_t ggml_backend_opencl_init(void);
+GGML_BACKEND_API bool ggml_backend_is_opencl(ggml_backend_t backend);
 
-void   ggml_cl_mul(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst);
-bool   ggml_cl_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst);
-size_t ggml_cl_mul_mat_get_wsize(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst);
-void   ggml_cl_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst, void * wdata, size_t wsize);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_buffer_type(void);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_host_buffer_type(void);
 
-void * ggml_cl_host_malloc(size_t size);
-void   ggml_cl_host_free(void * ptr);
-
-void ggml_cl_free_data(const struct ggml_tensor* tensor);
-
-void ggml_cl_transform_tensor(void * data, struct ggml_tensor * tensor);
+GGML_BACKEND_API ggml_backend_reg_t ggml_backend_opencl_reg(void);
 
 #ifdef  __cplusplus
 }
 #endif
+
+#endif // GGML_OPENCL_H
