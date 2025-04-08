@@ -85,17 +85,28 @@ namespace Internal {
 
     void Llama::unsafeInsertPrompt(FString v) {
         if (!ctx) {
-            UE_LOG(LogTemp, Error, TEXT("Llama context not active."));
+            UE_LOG(LogTemp, Error, TEXT("❌ Llama context not active."));
             return;
         }
 
-        string stdV = " " + string(TCHAR_TO_UTF8(*v));
-        vector<llama_token> line_inp;
+        std::string stdV = " " + std::string(TCHAR_TO_UTF8(*v));
+        std::vector<llama_token> line_inp;
         my_llama_tokenize(model, stdV, line_inp, false);
 
-        UE_LOG(LogTemp, Warning, TEXT("Inserting prompt: %s | %d tokens"), *v, line_inp.size());
+        if (line_inp.empty()) {
+            UE_LOG(LogTemp, Warning, TEXT("⚠️ Prompt tokenized to empty list — ignoring."));
+            return;
+        }
 
-        embd_inp.insert(embd_inp.end(), line_inp.begin(), line_inp.end());
+        UE_LOG(LogTemp, Warning, TEXT("📝 Inserting prompt: %s | %d tokens"), *v, static_cast<int>(line_inp.size()));
+
+        embd_inp = line_inp;
+        n_consumed = 0;
+
+        if (eos) {
+            UE_LOG(LogTemp, Warning, TEXT("🔄 New prompt detected after EOS — resuming."));
+            eos = false;
+        }
     }
 
     void Llama::activate(bool bReset, Params params) {
@@ -240,27 +251,26 @@ namespace Internal {
         const float temperature = 0.8f;
 
         while (running) {
-            // Process cross-thread messages
+            // Handle main->thread queued messages
             while (qMainToThread.processQ()) {
                 UE_LOG(LogTemp, Verbose, TEXT("✅ Processed main->thread message"));
             }
 
-            // Wait until model and context are ready
+            // Guard: model and context must be ready
             if (!ctx || !model) {
-                if (!running) break;
                 UE_LOG(LogTemp, Warning, TEXT("⏳ Context or model not ready."));
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 continue;
             }
 
-            // If we hit EOS and nothing more to process
+            // EOS check
             if (eos && n_consumed >= embd_inp.size()) {
                 UE_LOG(LogTemp, Warning, TEXT("🛑 EOS reached. Waiting for new prompt..."));
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 continue;
             }
 
-            // Nothing to do
+            // No tokens to process
             if (embd_inp.empty() || n_consumed >= embd_inp.size()) {
                 UE_LOG(LogTemp, Warning, TEXT("⏳ No input tokens to process. embd_inp.size()=%d, n_consumed=%d"),
                     static_cast<int>(embd_inp.size()), n_consumed);
@@ -271,7 +281,7 @@ namespace Internal {
             eos = false;
             const int n_ctx = llama_n_ctx(ctx);
 
-            // Prevent context overflow: sliding window
+            // Sliding window (if past exceeds context)
             if (n_past + (int)embd.size() > n_ctx) {
                 int n_left = n_past - n_keep;
                 n_past = std::max(1, n_keep);
@@ -285,23 +295,9 @@ namespace Internal {
                 UE_LOG(LogTemp, Warning, TEXT("🔁 Context full — sliding window applied."));
             }
 
-            // Run decode if needed
-            if (!embd.empty()) {
-                llama_batch batch = llama_batch_get_one(embd.data(), embd.size());
-                int res = llama_decode(ctx, batch);
-                llama_batch_free(batch);
-
-                if (res != 0) {
-                    UE_LOG(LogTemp, Error, TEXT("❌ llama_decode failed with code %d"), res);
-                    continue;
-                }
-
-                n_past += embd.size();
-            }
-
+            // Prepare embd with input tokens
+            UE_LOG(LogTemp, Warning, TEXT("📥 Preparing to consume input tokens"));
             embd.clear();
-
-            // Consume prompt tokens
             while (n_consumed < embd_inp.size()) {
                 llama_token tok = embd_inp[n_consumed++];
                 embd.push_back(tok);
@@ -313,61 +309,122 @@ namespace Internal {
 
             UE_LOG(LogTemp, Warning, TEXT("📥 Consumed user input tokens: %d"), embd.size());
 
-            // Run one decode step if embd now has content
+            
+            
+            // === Run llama_decode ===
             if (!embd.empty()) {
-                llama_batch batch = llama_batch_get_one(embd.data(), embd.size());
-                int res = llama_decode(ctx, batch);
-                llama_batch_free(batch);
+                UE_LOG(LogTemp, Warning, TEXT("🔄 Starting decode cycle for %d token(s)"), embd.size());
 
+                if (!embd.data()) {
+                    UE_LOG(LogTemp, Error, TEXT("❌ embd.data() is null!"));
+                    continue;
+                }
+
+                llama_batch batch = llama_batch_get_one(embd.data(), embd.size());
+
+                if (!batch.token) {
+                    UE_LOG(LogTemp, Error, TEXT("❌ llama_batch_get_one returned null token buffer."));
+                    continue;
+                }
+
+                int res = -1;
+                try {
+                    UE_LOG(LogTemp, Warning, TEXT("🧠 Calling llama_decode(ctx, batch)..."));
+                    res = llama_decode(ctx, batch);
+                    UE_LOG(LogTemp, Warning, TEXT("✅ llama_decode() call returned without exception. Result=%d"), res);
+                }
+                catch (...) {
+                    UE_LOG(LogTemp, Error, TEXT("❌ Exception caught during llama_decode()"));
+                    llama_batch_free(batch);
+                    continue;
+                }
+
+                UE_LOG(LogTemp, Warning, TEXT("📊 llama_decode() successful — attempting to fetch logits..."));
                 if (res != 0) {
-                    UE_LOG(LogTemp, Error, TEXT("❌ llama_decode() failed again with %d"), res);
+                    UE_LOG(LogTemp, Error, TEXT("❌ llama_decode() returned error code %d"), res);
                     continue;
                 }
 
                 n_past += embd.size();
 
-                // Generate next token (basic max_logit sampling for now)
                 float* logits = llama_get_logits(ctx);
                 if (!logits) {
-                    UE_LOG(LogTemp, Error, TEXT("❌ Logits null."));
+                    UE_LOG(LogTemp, Error, TEXT("❌ Logits are null — llama_get_logits(ctx) failed!"));
                     continue;
                 }
 
-                int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+                const llama_vocab* vocab = llama_model_get_vocab(model);
+                if (!vocab) {
+                    UE_LOG(LogTemp, Error, TEXT("❌ llama_model_get_vocab returned null!"));
+                    continue;
+                }
+
+                int vocab_size = llama_vocab_n_tokens(vocab);
+                if (vocab_size <= 0 || vocab_size > 1000000) {
+                    UE_LOG(LogTemp, Error, TEXT("❌ Vocab size seems invalid: %d"), vocab_size);
+                    continue;
+                }
+
+                UE_LOG(LogTemp, Warning, TEXT("🔡 Vocab size = %d. Beginning token sampling..."), vocab_size);
+
+                // === Sampling (greedy) ===
                 llama_token sampled = 0;
                 float max_logit = logits[0];
-
-                for (int i = 1; i < n_vocab; ++i) {
+                for (int i = 1; i < vocab_size; ++i) {
                     if (logits[i] > max_logit) {
                         max_logit = logits[i];
                         sampled = i;
                     }
                 }
 
+                UE_LOG(LogTemp, Warning, TEXT("🔡 Sampled token ID: %d | Max logit: %.4f"), sampled, max_logit);
+
+                // Validate sampled token
+                if (sampled < 0 || sampled >= vocab_size) {
+                    UE_LOG(LogTemp, Error, TEXT("❌ Sampled token %d is out of bounds! Vocab size is %d"), sampled, vocab_size);
+                    continue;
+                }
+
                 embd.clear();
                 embd.push_back(sampled);
-                last_n_tokens.erase(last_n_tokens.begin());
+                if (!last_n_tokens.empty()) last_n_tokens.erase(last_n_tokens.begin());
                 last_n_tokens.push_back(sampled);
+           
 
-                UE_LOG(LogTemp, Warning, TEXT("🧠 Sampled token: %d"), sampled);
+                std::string detok = llama_detokenize_bpe(model, embd);
+                UE_LOG(LogTemp, Warning, TEXT("🪄 Detokenized output: \"%s\""), *FString(UTF8_TO_TCHAR(detok.c_str())));
+                FString outStr = UTF8_TO_TCHAR(detok.c_str());
 
-                // Send detokenized result to main
-                FString outStr = UTF8_TO_TCHAR(llama_detokenize_bpe(model, embd).c_str());
                 qThreadToMain.enqueue([this, outStr = std::move(outStr)] {
-                    if (tokenCb) tokenCb(outStr);
+                    if (tokenCb) {
+                        UE_LOG(LogTemp, Verbose, TEXT("📤 Dispatching token to main thread: %s"), *outStr);
+                        tokenCb(outStr);
+                    }
                     });
 
-                if (sampled == llama_vocab_eos(llama_model_get_vocab(model))) {
+                // Autoregressive: Push token back
+                
+
+                if (n_past > 2 && sampled == llama_vocab_eos(vocab)) {
                     eos = true;
-                    UE_LOG(LogTemp, Warning, TEXT("🛑 EOS token detected. Ending inference."));
+                    UE_LOG(LogTemp, Warning, TEXT("🛑 EOS token detected. Inference will pause until next prompt."));
+                    continue;
                 }
+
+                // Don't push eos — only real content
+                embd_inp.push_back(sampled);
+                UE_LOG(LogTemp, Warning, TEXT("🔁 Inference cycle complete. Awaiting next tick."));
             }
+
+            // Thread stop check
             if (!running) break;
         }
 
         UE_LOG(LogTemp, Warning, TEXT("👋 LLaMA thread shutting down."));
         unsafeDeactivate();
     }
+
+
 
 
     void Llama::process() {
