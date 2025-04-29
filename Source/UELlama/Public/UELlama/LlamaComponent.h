@@ -9,85 +9,75 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <sstream>
 #include <vector>
 #include "llama.h"
 
 #include "LlamaComponent.generated.h"
 
-using namespace std;
+namespace LlamaInternal { // ✅ Proper named namespace (no anonymous)
 
-namespace {
     class Q {
     public:
-        void enqueue(function<void()>);
+        void enqueue(std::function<void()> func);
         bool processQ();
 
     private:
-        deque<function<void()>> q;
-        mutex mutex_;
+        std::deque<std::function<void()>> q;
+        std::mutex mutex_;
     };
-
-    void Q::enqueue(function<void()> v) {
-        lock_guard l(mutex_);
-        q.emplace_back(move(v));
-    }
-
-    bool Q::processQ() {
-        function<void()> v;
-        {
-            lock_guard l(mutex_);
-            if (q.empty()) return false;
-            v = move(q.front());
-            q.pop_front();
-        }
-        v();
-        return true;
-    }
 
     constexpr int n_threads = 4;
 
     struct Params {
-        FString prompt = "Hello";
-        FString pathToModel = "/path/to/your/model.gguf";
+        FString prompt = TEXT("Hello");
+        FString pathToModel = TEXT("/path/to/your/model.gguf");
         TArray<FString> stopSequences;
     };
 
-    vector<llama_token> my_llama_tokenize(llama_model* model, const string& text, vector<llama_token>& out, bool add_bos);
-    string llama_detokenize_bpe(llama_model* model, const vector<llama_token>& tokens);
+    std::vector<llama_token> my_llama_tokenize(llama_model* model, const std::string& text, std::vector<llama_token>& out, bool add_bos);
+    std::string llama_detokenize_bpe(llama_model* model, const std::vector<llama_token>& tokens);
+
 }
 
 namespace Internal {
+
     class Llama {
     public:
         Llama();
         ~Llama();
 
-        void activate(bool bReset, Params params);
+        void activate(bool bReset, LlamaInternal::Params params);
         void deactivate();
         void insertPrompt(FString prompt);
         void process();
+        void ResetHistory(); // ✨ Added ResetHistory
 
-        function<void(FString)> tokenCb;
+        std::function<void(FString)> tokenCb;
 
     private:
         llama_model* model = nullptr;
         llama_context* ctx = nullptr;
 
-        Q qMainToThread;
-        Q qThreadToMain;
-        atomic_bool running = false;
-        thread thread;
+        std::vector<std::pair<std::string, std::string>> chatHistory; // ✨ Chat log
+        FString systemPrompt = TEXT("You are a helpful assistant.");  // ✨ System prompt
+        std::ostringstream assistant_ss;                              // ✨ Accumulate assistant tokens
 
-        vector<llama_token> embd_inp;
-        vector<llama_token> embd;
-        vector<vector<llama_token>> stopSequences;
-        vector<llama_token> last_n_tokens;
+        LlamaInternal::Q qMainToThread;
+        LlamaInternal::Q qThreadToMain;
+        std::atomic_bool running = false;
+        std::thread thread;
+
+        std::vector<llama_token> embd_inp;
+        std::vector<llama_token> embd;
+        std::vector<std::vector<llama_token>> stopSequences;
+        std::vector<llama_token> last_n_tokens;
         int n_consumed = 0;
         int n_past = 0;
         bool eos = false;
 
         void threadRun();
-        void unsafeActivate(bool bReset, Params params);
+        void unsafeActivate(bool bReset, LlamaInternal::Params params);
         void unsafeDeactivate();
         void unsafeInsertPrompt(FString prompt);
     };
@@ -111,10 +101,10 @@ public:
     FOnNewTokenGenerated OnNewTokenGenerated;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    FString prompt = "Hello";
+    FString prompt = TEXT("Hello");
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    FString pathToModel = "/path/to/your/model.gguf";
+    FString pathToModel = TEXT("/path/to/your/model.gguf");
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     TArray<FString> stopSequences;
@@ -122,6 +112,9 @@ public:
     UFUNCTION(BlueprintCallable)
     void InsertPrompt(const FString& v);
 
+    UFUNCTION(BlueprintCallable)
+    void ResetHistory(); // ✨ Added ResetHistory
+
 private:
-    unique_ptr<Internal::Llama> llama;
+    std::unique_ptr<Internal::Llama> llama;
 };
