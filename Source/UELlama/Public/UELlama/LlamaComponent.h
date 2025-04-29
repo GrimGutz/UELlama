@@ -30,7 +30,7 @@ namespace LlamaInternal { // ✅ Proper named namespace (no anonymous)
     constexpr int n_threads = 4;
 
     struct Params {
-        FString prompt = TEXT("Hello");
+        FString prompt = TEXT("You are a friendly tavern keeper who welcomes adventurers.");
         FString pathToModel = TEXT("/path/to/your/model.gguf");
         TArray<FString> stopSequences;
     };
@@ -60,7 +60,7 @@ namespace Internal {
         llama_context* ctx = nullptr;
 
         std::vector<std::pair<std::string, std::string>> chatHistory; // ✨ Chat log
-        FString systemPrompt = TEXT("You are a helpful assistant.");  // ✨ System prompt
+        FString systemPrompt = TEXT("You are a friendly tavern keeper who welcomes adventurers.");  // ✨ System prompt
         std::ostringstream assistant_ss;                              // ✨ Accumulate assistant tokens
 
         LlamaInternal::Q qMainToThread;
@@ -101,7 +101,7 @@ public:
     FOnNewTokenGenerated OnNewTokenGenerated;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    FString prompt = TEXT("Hello");
+    FString prompt = TEXT("You are a friendly tavern keeper who welcomes adventurers.");
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     FString pathToModel = TEXT("/path/to/your/model.gguf");

@@ -94,8 +94,7 @@ namespace Internal {
         // Add new user message to history
         chatHistory.emplace_back("user", TCHAR_TO_UTF8(*userPrompt));
 
-        // Rebuild full prompt
-        string fullPrompt = "### System:\n" + string(TCHAR_TO_UTF8(*systemPrompt)) + "\n\n";
+        std::string fullPrompt;
         for (const auto& [role, msg] : chatHistory) {
             fullPrompt += "### " + role + ":\n" + msg + "\n\n";
         }
@@ -159,6 +158,43 @@ namespace Internal {
             model = nullptr;
             return;
         }
+        // === WARMUP ===
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Running warmup decode with BOS token..."));
+
+            const llama_vocab* vocab = llama_model_get_vocab(model);
+            llama_token bos_token = llama_vocab_bos(vocab);
+
+            if (bos_token == LLAMA_TOKEN_NULL) {
+                bos_token = 1; // fallback (sometimes BOS is ID 1)
+            }
+
+            llama_batch batch = llama_batch_init(1, 0, 1);
+            if (!batch.token) {
+                UE_LOG(LogTemp, Error, TEXT("Batch init failed during warmup."));
+                llama_batch_free(batch);
+                unsafeDeactivate();
+                return;
+            }
+
+            batch.n_tokens = 1;
+            batch.token[0] = bos_token;
+            batch.pos[0] = 0;
+            batch.n_seq_id[0] = 1;
+            batch.seq_id[0][0] = 0;
+            batch.logits[0] = 1;
+
+            if (llama_decode(ctx, batch) != 0) {
+                UE_LOG(LogTemp, Error, TEXT("Warmup decode failed."));
+                llama_batch_free(batch);
+                unsafeDeactivate();
+                return;
+            }
+
+            llama_batch_free(batch);
+
+            UE_LOG(LogTemp, Warning, TEXT("✅ Warmup completed."));
+        }
         stopSequences.clear();
 
         for (const FString& seq : params.stopSequences) {
@@ -173,6 +209,11 @@ namespace Internal {
 
         systemPrompt = params.prompt;
         chatHistory.clear();
+
+        if (!systemPrompt.IsEmpty()) {
+            // Insert system prompt into chat history
+            chatHistory.emplace_back("system", TCHAR_TO_UTF8(*systemPrompt));
+        }
         assistant_ss.str("");
         embd_inp.clear();
         n_consumed = 0;
