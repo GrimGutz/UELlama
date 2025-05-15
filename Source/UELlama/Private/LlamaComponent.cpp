@@ -92,23 +92,33 @@ namespace Internal {
         }
 
         // Add new user message to history
+        std::string userMessage = "### user:\n" + std::string(TCHAR_TO_UTF8(*userPrompt)) + "\n\n";
         chatHistory.emplace_back("user", TCHAR_TO_UTF8(*userPrompt));
 
-        std::string fullPrompt;
-        for (const auto& [role, msg] : chatHistory) {
-            fullPrompt += "### " + role + ":\n" + msg + "\n\n";
-        }
-        fullPrompt += "### Assistant:\n";
+        // Tokenize only the new user message
+        std::vector<llama_token> userTokens;
+        LlamaInternal::my_llama_tokenize(model, userMessage, userTokens, false);
 
-        vector<llama_token> tokens;
-        LlamaInternal::my_llama_tokenize(model, fullPrompt, tokens, true);
-
-        if (tokens.empty()) {
-            UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize full chat prompt."));
+        if (userTokens.empty()) {
+            UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize user message."));
             return;
         }
 
-        embd_inp = move(tokens);
+        // Tokenize the assistant prefix
+        std::string assistantHeader = "### Assistant:\n";
+        std::vector<llama_token> assistantIntro;
+        LlamaInternal::my_llama_tokenize(model, assistantHeader, assistantIntro, false);
+
+        if (assistantIntro.empty()) {
+            UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize assistant header."));
+            return;
+        }
+
+        // Build the input for this round
+        embd_inp = promptTokens;
+        embd_inp.insert(embd_inp.end(), userTokens.begin(), userTokens.end());
+        embd_inp.insert(embd_inp.end(), assistantIntro.begin(), assistantIntro.end());
+
         n_consumed = 0;
         eos = false;
         assistant_ss.str(""); // clear assistant accumulation
@@ -196,7 +206,17 @@ namespace Internal {
             UE_LOG(LogTemp, Warning, TEXT("✅ Warmup completed."));
         }
         stopSequences.clear();
-
+        // Add default stop sequences if none were passed in
+        if (params.stopSequences.IsEmpty()) {
+            params.stopSequences = {
+                TEXT("### user:"),
+                TEXT("### system:"),
+                TEXT("Player:"),
+                TEXT("\n\n"),
+                TEXT("#"),
+                TEXT("###"),// Optional but often useful
+            };
+        }
         for (const FString& seq : params.stopSequences) {
             std::string utf8_seq = TCHAR_TO_UTF8(*seq);
             std::vector<llama_token> seq_tokens;
@@ -209,10 +229,22 @@ namespace Internal {
 
         systemPrompt = params.prompt;
         chatHistory.clear();
+        promptTokens.clear();  // <-- ✅ Reset token buffer here
 
         if (!systemPrompt.IsEmpty()) {
-            // Insert system prompt into chat history
-            chatHistory.emplace_back("system", TCHAR_TO_UTF8(*systemPrompt));
+            std::string sysText = TCHAR_TO_UTF8(*systemPrompt);
+            chatHistory.emplace_back("system", sysText);
+
+            std::string systemMsg = "### system:\n" + sysText + "\n\n";
+            std::vector<llama_token> sysTokens;
+            LlamaInternal::my_llama_tokenize(model, systemMsg, sysTokens, true);  // ✅ Add BOS here only once
+
+            if (!sysTokens.empty()) {
+                promptTokens = std::move(sysTokens);  // ✅ Store system prompt tokens
+            }
+            else {
+                UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize system prompt."));
+            }
         }
         assistant_ss.str("");
         embd_inp.clear();
@@ -313,12 +345,23 @@ namespace Internal {
                     if (pos != std::string::npos) {
                         reply = reply.substr(0, pos);
                     }
+
                     assistant_ss.str("");
                     assistant_ss << reply;
 
                     // Save reply to history
                     if (!reply.empty()) {
                         chatHistory.emplace_back("assistant", reply);
+
+                        // Retokenize trimmed assistant reply for incremental promptTokens
+                        std::string assistantMsg = reply + "\n\n";
+                        std::vector<llama_token> assistantTokens;
+                        LlamaInternal::my_llama_tokenize(model, assistantMsg, assistantTokens, false);
+                        promptTokens.insert(
+                            promptTokens.end(),
+                            std::make_move_iterator(assistantTokens.begin()),
+                            std::make_move_iterator(assistantTokens.end())
+                        );
                     }
 
                     UE_LOG(LogTemp, Warning, TEXT("✅ Assistant stopped by stop sequence."));
@@ -352,7 +395,18 @@ namespace Internal {
                 std::string assistantReply = assistant_ss.str();
                 if (!assistantReply.empty()) {
                     chatHistory.emplace_back("assistant", assistantReply);
+
+                    // Retokenize assistant reply and add to promptTokens
+                    std::string assistantMsg = assistantReply + "\n\n";
+                    std::vector<llama_token> assistantTokens;
+                    LlamaInternal::my_llama_tokenize(model, assistantMsg, assistantTokens, false);
+                    promptTokens.insert(
+                        promptTokens.end(),
+                        std::make_move_iterator(assistantTokens.begin()),
+                        std::make_move_iterator(assistantTokens.end())
+                    );
                 }
+
                 assistant_ss.str(""); // clear assistant text
 
                 UE_LOG(LogTemp, Warning, TEXT("✅ Assistant answer saved. Waiting for next user input."));
@@ -377,6 +431,7 @@ namespace Internal {
 
     void Llama::ResetHistory() {
         chatHistory.clear();
+		promptTokens.clear();
         assistant_ss.str("");
         eos = false;
         n_consumed = 0;

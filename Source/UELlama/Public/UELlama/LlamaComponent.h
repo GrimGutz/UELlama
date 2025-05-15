@@ -67,6 +67,7 @@ namespace Internal {
         LlamaInternal::Q qThreadToMain;
         std::atomic_bool running = false;
         std::thread thread;
+        std::vector<llama_token> promptTokens;
 
         std::vector<llama_token> embd_inp;
         std::vector<llama_token> embd;
