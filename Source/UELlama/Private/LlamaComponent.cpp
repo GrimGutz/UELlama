@@ -91,38 +91,39 @@ namespace Internal {
             return;
         }
 
-        // Add new user message to history
+        // Add new user message to chat history
         std::string userMessage = "### user:\n" + std::string(TCHAR_TO_UTF8(*userPrompt)) + "\n\n";
         chatHistory.emplace_back("user", TCHAR_TO_UTF8(*userPrompt));
 
-        // Tokenize only the new user message
+        // Tokenize user message
         std::vector<llama_token> userTokens;
         LlamaInternal::my_llama_tokenize(model, userMessage, userTokens, false);
-
         if (userTokens.empty()) {
             UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize user message."));
             return;
         }
 
-        // Tokenize the assistant prefix
+        // Tokenize assistant prefix
         std::string assistantHeader = "### Assistant:\n";
         std::vector<llama_token> assistantIntro;
         LlamaInternal::my_llama_tokenize(model, assistantHeader, assistantIntro, false);
-
         if (assistantIntro.empty()) {
             UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize assistant header."));
             return;
         }
 
-        // Build the input for this round
-        embd_inp = promptTokens;
-        embd_inp.insert(embd_inp.end(), userTokens.begin(), userTokens.end());
+        // Build new tokens to insert — only new user input + assistant header
+        embd_inp = userTokens;
         embd_inp.insert(embd_inp.end(), assistantIntro.begin(), assistantIntro.end());
 
+        // Track and reset for generation
         n_consumed = 0;
         eos = false;
-        assistant_ss.str(""); // clear assistant accumulation
+        assistant_ss.str("");
+
+        UE_LOG(LogTemp, Warning, TEXT("📦 embd_inp initialized with %d tokens (user + assistant header)."), embd_inp.size());
     }
+
 
     void Llama::activate(bool bReset, LlamaInternal::Params params) {
         qMainToThread.enqueue([this, params = std::move(params), bReset]() mutable {
@@ -237,10 +238,22 @@ namespace Internal {
 
             std::string systemMsg = "### system:\n" + sysText + "\n\n";
             std::vector<llama_token> sysTokens;
-            LlamaInternal::my_llama_tokenize(model, systemMsg, sysTokens, true);  // ✅ Add BOS here only once
+            LlamaInternal::my_llama_tokenize(model, systemMsg, sysTokens, true);  // ✅ Add BOS
 
             if (!sysTokens.empty()) {
-                promptTokens = std::move(sysTokens);  // ✅ Store system prompt tokens
+                promptTokens = std::move(sysTokens);  // ✅ Save system tokens
+                systemPromptTokenCount = static_cast<int>(promptTokens.size());
+
+                // ✅ Feed system prompt to model context
+                llama_batch systemBatch = llama_batch_get_one(promptTokens.data(), static_cast<int>(promptTokens.size()));
+                if (llama_decode(ctx, systemBatch) != 0) {
+                    UE_LOG(LogTemp, Error, TEXT("❌ Failed to decode system prompt into model context."));
+                    unsafeDeactivate();
+                    return;
+                }
+
+                n_past = static_cast<int>(promptTokens.size());
+                UE_LOG(LogTemp, Warning, TEXT("✅ System prompt fed into model context. n_past = %d"), n_past);
             }
             else {
                 UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize system prompt."));
@@ -292,17 +305,30 @@ namespace Internal {
             }
 
             embd.clear();
-            while (n_consumed < embd_inp.size() && embd.size() < 512) {
-                embd.push_back(embd_inp[n_consumed++]);
-            }
 
-            llama_batch batch = llama_batch_get_one(embd.data(), embd.size());
-            if (llama_decode(ctx, batch) != 0) {
-                UE_LOG(LogTemp, Error, TEXT("❌ llama_decode failed."));
+            int ctxLimit = llama_n_ctx(ctx);
+            int maxTokensLeft = ctxLimit - n_past;
+
+            if (maxTokensLeft <= 0) {
+                UE_LOG(LogTemp, Error, TEXT("❌ Context full. n_past = %d, ctxLimit = %d"), n_past, ctxLimit);
+                eos = true;
                 continue;
             }
 
-            n_past += embd.size();
+            int batchLimit = FMath::Min(512, maxTokensLeft);
+
+            while (n_consumed < embd_inp.size() && embd.size() < static_cast<size_t>(batchLimit)) {
+                embd.push_back(embd_inp[n_consumed++]);
+            }
+
+            llama_batch batch = llama_batch_get_one(embd.data(), static_cast<int>(embd.size()));
+            if (llama_decode(ctx, batch) != 0) {
+                UE_LOG(LogTemp, Error, TEXT("❌ llama_decode failed. n_past = %d, batch = %d, ctx = %d"), n_past, (int)embd.size(), ctxLimit);
+                eos = true;
+                continue;
+            }
+
+            n_past += static_cast<int>(embd.size());
 
             float* logits = llama_get_logits(ctx);
             if (!logits) continue;
@@ -344,6 +370,10 @@ namespace Internal {
                     size_t pos = reply.rfind(TCHAR_TO_UTF8(*stopText));
                     if (pos != std::string::npos) {
                         reply = reply.substr(0, pos);
+                        UE_LOG(LogTemp, Warning, TEXT("✂️ Trimming assistant reply at stop sequence position: %d"), static_cast<int>(pos));
+                    }
+                    else {
+                        UE_LOG(LogTemp, Warning, TEXT("⚠️ Expected stop sequence not found in assistant string (possible detokenization mismatch)"));
                     }
 
                     assistant_ss.str("");
@@ -352,28 +382,32 @@ namespace Internal {
                     // Save reply to history
                     if (!reply.empty()) {
                         chatHistory.emplace_back("assistant", reply);
+                        UE_LOG(LogTemp, Warning, TEXT("💬 Final assistant reply saved to history: %s"), *FString(UTF8_TO_TCHAR(reply.c_str())));
 
                         // Retokenize trimmed assistant reply for incremental promptTokens
                         std::string assistantMsg = reply + "\n\n";
                         std::vector<llama_token> assistantTokens;
                         LlamaInternal::my_llama_tokenize(model, assistantMsg, assistantTokens, false);
+                        UE_LOG(LogTemp, Warning, TEXT("🔁 Retokenized assistant reply into %d tokens."), assistantTokens.size());
+
                         promptTokens.insert(
                             promptTokens.end(),
                             std::make_move_iterator(assistantTokens.begin()),
                             std::make_move_iterator(assistantTokens.end())
                         );
+
+                        UE_LOG(LogTemp, Warning, TEXT("🧠 Assistant tokens appended to promptTokens. Total tokens: %d"), promptTokens.size());
+                    }
+                    else {
+                        UE_LOG(LogTemp, Warning, TEXT("ℹ️ Assistant reply was empty after trimming."));
                     }
 
                     UE_LOG(LogTemp, Warning, TEXT("✅ Assistant stopped by stop sequence."));
                     continue;
                 }
+
             }
-            FString tokenOut = UTF8_TO_TCHAR(detok.c_str());
-            qThreadToMain.enqueue([this, tokenOut = std::move(tokenOut)] {
-                if (tokenCb) {
-                    tokenCb(tokenOut);
-                }
-                });
+           
 
             bool stop_generation = false;
 
@@ -405,6 +439,7 @@ namespace Internal {
                         std::make_move_iterator(assistantTokens.begin()),
                         std::make_move_iterator(assistantTokens.end())
                     );
+                    UE_LOG(LogTemp, Warning, TEXT("🧠 Assistant tokens appended to promptTokens. Total tokens: %d"), promptTokens.size());
                 }
 
                 assistant_ss.str(""); // clear assistant text
@@ -412,7 +447,15 @@ namespace Internal {
                 UE_LOG(LogTemp, Warning, TEXT("✅ Assistant answer saved. Waiting for next user input."));
                 continue; // go back to sleep and wait
             }
-
+            if (eos != true) {
+                FString tokenOut = UTF8_TO_TCHAR(detok.c_str());
+                qThreadToMain.enqueue([this, tokenOut = std::move(tokenOut)] {
+                    if (tokenCb) {
+                        tokenCb(tokenOut);
+                    }
+                    });
+            }
+            
             // Continue generation: push sampled token back
             if (n_consumed >= embd_inp.size()) {
                 // Prompt is fully consumed — now autoregressive phase

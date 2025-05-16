@@ -76,6 +76,7 @@ namespace Internal {
         int n_consumed = 0;
         int n_past = 0;
         bool eos = false;
+        int systemPromptTokenCount = 0;
 
         void threadRun();
         void unsafeActivate(bool bReset, LlamaInternal::Params params);
