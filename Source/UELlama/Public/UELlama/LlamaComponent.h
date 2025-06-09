@@ -15,6 +15,13 @@
 
 #include "LlamaComponent.generated.h"
 
+UENUM(BlueprintType)
+enum class EPromptRole : uint8 {
+    System      UMETA(DisplayName = "System"),
+    User        UMETA(DisplayName = "User"),
+    Assistant   UMETA(DisplayName = "Assistant"),
+};
+
 namespace LlamaInternal { // ✅ Proper named namespace (no anonymous)
 
     class Q {
@@ -34,7 +41,8 @@ namespace LlamaInternal { // ✅ Proper named namespace (no anonymous)
         FString pathToModel = TEXT("/path/to/your/model.gguf");
         TArray<FString> stopSequences;
     };
-
+    std::string RoleToLabel(EPromptRole role);
+    std::string RoleToName(EPromptRole role);
     std::vector<llama_token> my_llama_tokenize(llama_model* model, const std::string& text, std::vector<llama_token>& out, bool add_bos);
     std::string llama_detokenize_bpe(llama_model* model, const std::vector<llama_token>& tokens);
 
@@ -49,7 +57,8 @@ namespace Internal {
 
         void activate(bool bReset, LlamaInternal::Params params);
         void deactivate();
-        void insertPrompt(FString prompt);
+        void insertPrompt(FString prompt); // Defaults to User
+        void insertPrompt(EPromptRole role, FString prompt); // ✅ New version with role
         void process();
         void ResetHistory(); // ✨ Added ResetHistory
 
@@ -82,8 +91,10 @@ namespace Internal {
         void unsafeActivate(bool bReset, LlamaInternal::Params params);
         void unsafeDeactivate();
         void unsafeInsertPrompt(FString prompt);
+        void unsafeInsertPrompt(EPromptRole role, FString prompt); // ✅ New version
     };
 }
+
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnNewTokenGenerated, FString, NewToken);
 
@@ -112,8 +123,10 @@ public:
     TArray<FString> stopSequences;
 
     UFUNCTION(BlueprintCallable)
-    void InsertPrompt(const FString& v);
+    void InsertPrompt(const FString& v);  // Defaults to User
 
+    UFUNCTION(BlueprintCallable, Category = "LLM")
+    void InsertPromptWithRole(EPromptRole Role, const FString& v);
     UFUNCTION(BlueprintCallable)
     void ResetHistory(); // ✨ Added ResetHistory
 

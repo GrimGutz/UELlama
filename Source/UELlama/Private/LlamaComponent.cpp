@@ -5,7 +5,23 @@ using namespace std;
 // --- LlamaInternal implementations ---
 
 namespace LlamaInternal {
+    std::string RoleToLabel(EPromptRole role) {
+        switch (role) {
+        case EPromptRole::System:    return "### system:\n";
+        case EPromptRole::User:      return "### user:\n";
+        case EPromptRole::Assistant: return "### assistant:\n";
+        default:                     return "### unknown:\n";
+        }
+    }
 
+    std::string RoleToName(EPromptRole role) {
+        switch (role) {
+        case EPromptRole::System:    return "system";
+        case EPromptRole::User:      return "user";
+        case EPromptRole::Assistant: return "assistant";
+        default:                     return "unknown";
+        }
+    }
     void Q::enqueue(function<void()> func) {
         lock_guard<mutex> lock(mutex_);
         q.emplace_back(move(func));
@@ -78,7 +94,47 @@ namespace Internal {
             thread.join();
         }
     }
+    void Llama::insertPrompt(EPromptRole role, FString prompt) {
+        qMainToThread.enqueue([this, role, prompt = std::move(prompt)]() mutable {
+            unsafeInsertPrompt(role, std::move(prompt));
+            });
+    }
+    void Llama::unsafeInsertPrompt(EPromptRole role, FString prompt) {
+        if (!ctx || !model) {
+            UE_LOG(LogTemp, Error, TEXT("❌ Context not ready"));
+            return;
+        }
 
+        std::string promptText = TCHAR_TO_UTF8(*prompt);
+        std::string header = LlamaInternal::RoleToLabel(role);
+        std::string roleName = LlamaInternal::RoleToName(role);
+        std::string message = header + promptText + "\n\n";
+
+        chatHistory.emplace_back(roleName, promptText);
+
+        std::vector<llama_token> tokens;
+        LlamaInternal::my_llama_tokenize(model, message, tokens, role == EPromptRole::System);
+
+        if (tokens.empty()) {
+            UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize %s message."), *FString(roleName.c_str()));
+            return;
+        }
+
+        embd_inp = std::move(tokens);
+
+        if (role == EPromptRole::User) {
+            std::string assistantHeader = "### assistant:\n";
+            std::vector<llama_token> assistantIntro;
+            LlamaInternal::my_llama_tokenize(model, assistantHeader, assistantIntro, false);
+            embd_inp.insert(embd_inp.end(), assistantIntro.begin(), assistantIntro.end());
+        }
+
+        n_consumed = 0;
+        eos = false;
+        assistant_ss.str("");
+
+        UE_LOG(LogTemp, Warning, TEXT("📦 embd_inp initialized for %s role with %d tokens."), *FString(roleName.c_str()), embd_inp.size());
+    }
     void Llama::insertPrompt(FString userPrompt) {
         qMainToThread.enqueue([this, userPrompt = std::move(userPrompt)]() mutable {
             unsafeInsertPrompt(std::move(userPrompt));
@@ -104,7 +160,7 @@ namespace Internal {
         }
 
         // Tokenize assistant prefix
-        std::string assistantHeader = "### Assistant:\n";
+        std::string assistantHeader = "### assistant:\n";
         std::vector<llama_token> assistantIntro;
         LlamaInternal::my_llama_tokenize(model, assistantHeader, assistantIntro, false);
         if (assistantIntro.empty()) {
@@ -254,11 +310,48 @@ namespace Internal {
 
                 n_past = static_cast<int>(promptTokens.size());
                 UE_LOG(LogTemp, Warning, TEXT("✅ System prompt fed into model context. n_past = %d"), n_past);
+                // === SECOND WARMUP ===
+                {
+                    UE_LOG(LogTemp, Warning, TEXT("Running second warmup decode after system prompt..."));
+
+                    const llama_vocab* vocab = llama_model_get_vocab(model);
+                    llama_token bos_token = llama_vocab_bos(vocab);
+
+                    if (bos_token == LLAMA_TOKEN_NULL) {
+                        bos_token = 1;
+                    }
+
+                    llama_batch batch = llama_batch_init(1, 0, 1);
+                    if (!batch.token) {
+                        UE_LOG(LogTemp, Error, TEXT("Batch init failed during second warmup."));
+                        llama_batch_free(batch);
+                        unsafeDeactivate();
+                        return;
+                    }
+
+                    batch.n_tokens = 1;
+                    batch.token[0] = bos_token;
+                    batch.pos[0] = n_past;  // continue from after system prompt
+                    batch.n_seq_id[0] = 1;
+                    batch.seq_id[0][0] = 0;
+                    batch.logits[0] = 1;
+
+                    if (llama_decode(ctx, batch) != 0) {
+                        UE_LOG(LogTemp, Error, TEXT("Second warmup decode failed."));
+                        llama_batch_free(batch);
+                        unsafeDeactivate();
+                        return;
+                    }
+
+                    llama_batch_free(batch);
+                    UE_LOG(LogTemp, Warning, TEXT("✅ Second warmup completed."));
+                }
             }
             else {
                 UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize system prompt."));
             }
         }
+
         assistant_ss.str("");
         embd_inp.clear();
         n_consumed = 0;
@@ -519,7 +612,11 @@ void ULlamaComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActor
 void ULlamaComponent::InsertPrompt(const FString& v) {
     llama->insertPrompt(v);
 }
-
+void ULlamaComponent::InsertPromptWithRole(EPromptRole Role, const FString& Prompt) {
+    if (llama) {
+        llama->insertPrompt(Role, Prompt);
+    }
+}
 void ULlamaComponent::ResetHistory() {
     if (llama) llama->ResetHistory();
 }
