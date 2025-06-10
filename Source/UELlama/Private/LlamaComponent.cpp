@@ -120,21 +120,37 @@ namespace Internal {
             return;
         }
 
-        embd_inp = std::move(tokens);
+        // Always feed context
+        llama_batch batch = llama_batch_get_one(tokens.data(), static_cast<int>(tokens.size()));
+        if (llama_decode(ctx, batch) != 0) {
+            UE_LOG(LogTemp, Error, TEXT("❌ Failed to decode %s message into model context."), *FString(roleName.c_str()));
+            return;
+        }
 
+        promptTokens.insert(promptTokens.end(),
+            std::make_move_iterator(tokens.begin()),
+            std::make_move_iterator(tokens.end()));
+        n_past += static_cast<int>(tokens.size());
+
+        // 🧠 Only prepare input for user prompts
         if (role == EPromptRole::User) {
-            std::string assistantHeader = "### assistant:\n";
+            embd_inp = std::move(tokens);  // re-use if needed
+            std::string assistantHeader = "### Assistant:\n";
             std::vector<llama_token> assistantIntro;
             LlamaInternal::my_llama_tokenize(model, assistantHeader, assistantIntro, false);
             embd_inp.insert(embd_inp.end(), assistantIntro.begin(), assistantIntro.end());
+
+            n_consumed = 0;
+            eos = false;
+            assistant_ss.str("");
+
+            UE_LOG(LogTemp, Warning, TEXT("📦 embd_inp initialized for user with %d tokens."), embd_inp.size());
         }
-
-        n_consumed = 0;
-        eos = false;
-        assistant_ss.str("");
-
-        UE_LOG(LogTemp, Warning, TEXT("📦 embd_inp initialized for %s role with %d tokens."), *FString(roleName.c_str()), embd_inp.size());
+        else {
+            UE_LOG(LogTemp, Warning, TEXT("📥 %s prompt inserted without triggering generation."), *FString(roleName.c_str()));
+        }
     }
+
     void Llama::insertPrompt(FString userPrompt) {
         qMainToThread.enqueue([this, userPrompt = std::move(userPrompt)]() mutable {
             unsafeInsertPrompt(std::move(userPrompt));
@@ -310,42 +326,7 @@ namespace Internal {
 
                 n_past = static_cast<int>(promptTokens.size());
                 UE_LOG(LogTemp, Warning, TEXT("✅ System prompt fed into model context. n_past = %d"), n_past);
-                // === SECOND WARMUP ===
-                {
-                    UE_LOG(LogTemp, Warning, TEXT("Running second warmup decode after system prompt..."));
-
-                    const llama_vocab* vocab = llama_model_get_vocab(model);
-                    llama_token bos_token = llama_vocab_bos(vocab);
-
-                    if (bos_token == LLAMA_TOKEN_NULL) {
-                        bos_token = 1;
-                    }
-
-                    llama_batch batch = llama_batch_init(1, 0, 1);
-                    if (!batch.token) {
-                        UE_LOG(LogTemp, Error, TEXT("Batch init failed during second warmup."));
-                        llama_batch_free(batch);
-                        unsafeDeactivate();
-                        return;
-                    }
-
-                    batch.n_tokens = 1;
-                    batch.token[0] = bos_token;
-                    batch.pos[0] = n_past;  // continue from after system prompt
-                    batch.n_seq_id[0] = 1;
-                    batch.seq_id[0][0] = 0;
-                    batch.logits[0] = 1;
-
-                    if (llama_decode(ctx, batch) != 0) {
-                        UE_LOG(LogTemp, Error, TEXT("Second warmup decode failed."));
-                        llama_batch_free(batch);
-                        unsafeDeactivate();
-                        return;
-                    }
-
-                    llama_batch_free(batch);
-                    UE_LOG(LogTemp, Warning, TEXT("✅ Second warmup completed."));
-                }
+                
             }
             else {
                 UE_LOG(LogTemp, Error, TEXT("⚠️ Failed to tokenize system prompt."));
